@@ -84,10 +84,10 @@ class TestAfterGridMessageStates(unittest.TestCase):
         self.chat.handle_ack(msg_id, "delivered", "Bob")
         self.assertIn("Bob", self.chat.my_messages[msg_id]["delivered_by"])
         
-        # Comprobar el doble check gris oscuro en el historial
+        # Comprobar el doble check gris claro en el historial
         formatted_line = self.chat.message_history[0]
         self.assertIn("✓✓", formatted_line)
-        self.assertIn("1;30m", formatted_line) # Color del delivered (gris oscuro)
+        self.assertIn("37m", formatted_line) # Color del delivered (gris claro/blanco tenue)
 
     def test_ack_read_transition(self):
         """Prueba la transición de estado 'delivered' -> 'read' (doble check azul)."""

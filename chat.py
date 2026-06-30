@@ -8,7 +8,7 @@ import uuid
 import argparse
 import subprocess
 from datetime import datetime
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import websockets
@@ -133,13 +133,13 @@ class EncryptedChat:
         delivered_users = msg.get("delivered_by", set())
         read_users = msg.get("read_by", set())
         
-        status_indicator = "\033[30m✓\033[0m" # Un check gris (enviado)
+        status_indicator = "\033[90m✓\033[0m" # Un check gris visible en fondos negros (enviado)
         if read_users:
             names = ", ".join(sorted(read_users))
-            status_indicator = f"\033[1;34m✓✓ ({names})\033[0m" # Doble check azul con lectores
+            status_indicator = f"\033[1;34m✓✓ ({names})\033[0m" # Doble check azul brillante con lectores
         elif delivered_users:
             names = ", ".join(sorted(delivered_users))
-            status_indicator = f"\033[1;30m✓✓ ({names})\033[0m" # Doble check gris con receptores
+            status_indicator = f"\033[37m✓✓ ({names})\033[0m" # Doble check gris claro/blanco tenue con receptores
 
         # Buscamos si ya existe el mensaje en la pantalla para actualizarlo, si no, lo agregamos
         search_key = f"ID:{msg_id}"
@@ -270,8 +270,10 @@ class EncryptedChat:
             elif p_type == "pong":
                 pass
 
+        except InvalidToken:
+            self.add_system_message("Advertencia: No se pudo descifrar un mensaje de red. Comprueba que la contraseña es idéntica en ambos terminales.", is_error=True)
         except Exception as e:
-            # Si no se puede descifrar o procesar, se ignora (posible clave incorrecta de un intruso)
+            # Si no se puede descifrar o procesar por otro motivo, se ignora
             pass
 
     async def connection_handler(self, ws):
