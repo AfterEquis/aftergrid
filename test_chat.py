@@ -62,12 +62,13 @@ class TestAfterGridMessageStates(unittest.TestCase):
         self.chat.chat_area = MagicMock()
 
     def test_outgoing_message_initial_state(self):
-        """Prueba que los mensajes salientes inicien en estado 'sent' con un check gris."""
+        """Prueba que los mensajes salientes inicien con conjuntos vacíos de acks."""
         msg_id = "msg1"
         self.chat.add_outgoing_message("Hola", msg_id, "12:00:00")
         
         self.assertIn(msg_id, self.chat.my_messages)
-        self.assertEqual(self.chat.my_messages[msg_id]["status"], "sent")
+        self.assertEqual(len(self.chat.my_messages[msg_id]["delivered_by"]), 0)
+        self.assertEqual(len(self.chat.my_messages[msg_id]["read_by"]), 0)
         
         # Comprobar que en el historial visual se dibuja el check único gris
         formatted_line = self.chat.message_history[0]
@@ -79,9 +80,9 @@ class TestAfterGridMessageStates(unittest.TestCase):
         msg_id = "msg2"
         self.chat.add_outgoing_message("Hola", msg_id, "12:00:00")
         
-        # Simulamos llegada de ACK delivered
-        self.chat.handle_ack(msg_id, "delivered")
-        self.assertEqual(self.chat.my_messages[msg_id]["status"], "delivered")
+        # Simulamos llegada de ACK delivered de Bob
+        self.chat.handle_ack(msg_id, "delivered", "Bob")
+        self.assertIn("Bob", self.chat.my_messages[msg_id]["delivered_by"])
         
         # Comprobar el doble check gris oscuro en el historial
         formatted_line = self.chat.message_history[0]
@@ -93,12 +94,12 @@ class TestAfterGridMessageStates(unittest.TestCase):
         msg_id = "msg3"
         self.chat.add_outgoing_message("Hola", msg_id, "12:00:00")
         
-        # Delived primero
-        self.chat.handle_ack(msg_id, "delivered")
-        # Read después
-        self.chat.handle_ack(msg_id, "read")
+        # Delived primero de Bob
+        self.chat.handle_ack(msg_id, "delivered", "Bob")
+        # Read después de Bob
+        self.chat.handle_ack(msg_id, "read", "Bob")
         
-        self.assertEqual(self.chat.my_messages[msg_id]["status"], "read")
+        self.assertIn("Bob", self.chat.my_messages[msg_id]["read_by"])
         
         # Comprobar el doble check azul en el historial
         formatted_line = self.chat.message_history[0]
@@ -110,19 +111,20 @@ class TestAfterGridMessageStates(unittest.TestCase):
         msg_id = "msg4"
         self.chat.add_outgoing_message("Hola", msg_id, "12:00:00")
         
-        # Pasa directamente a read
-        self.chat.handle_ack(msg_id, "read")
-        self.assertEqual(self.chat.my_messages[msg_id]["status"], "read")
+        # Pasa directamente a read de Bob
+        self.chat.handle_ack(msg_id, "read", "Bob")
+        self.assertIn("Bob", self.chat.my_messages[msg_id]["read_by"])
         
-        # Un delivered tardío de red no debe sobreescribir el 'read'
-        self.chat.handle_ack(msg_id, "delivered")
-        self.assertEqual(self.chat.my_messages[msg_id]["status"], "read")
+        # Un delivered tardío de red de Bob no debe sobreescribir el 'read'
+        self.chat.handle_ack(msg_id, "delivered", "Bob")
+        self.assertIn("Bob", self.chat.my_messages[msg_id]["read_by"])
 
 
 class TestAfterGridNetworkIntegration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.key = derive_key("password-secreta-integracion")
         self.server_chat = EncryptedChat(self.key, "Servidor")
+        self.server_chat.is_server = True
         self.client_chat = EncryptedChat(self.key, "Cliente")
         
         # Desactivamos UI para evitar interferencias
@@ -141,20 +143,17 @@ class TestAfterGridNetworkIntegration(unittest.IsolatedAsyncioTestCase):
         # Iniciamos el cliente conectándolo a ese puerto
         client_task = asyncio.create_task(self.client_chat.start_client(f"ws://127.0.0.1:{port}"))
         
-        # Esperamos a que la conexión se establezca y se intercambien los pings iniciales de apodos
-        # Damos un timeout corto de 2 segundos para la comunicación loopback
+        # Esperamos a que la conexión se establezca y se sincronicen
         for _ in range(20):
             await asyncio.sleep(0.1)
             if self.server_chat.is_connected and self.client_chat.is_connected:
-                # Comprobamos que ambos detectaron y sincronizaron el apodo del otro correctamente
-                if self.server_chat.peer_nickname == "Cliente" and self.client_chat.peer_nickname == "Servidor":
+                if len(self.server_chat.connected_clients) == 1:
                     break
         
         # Comprobaciones
         self.assertTrue(self.server_chat.is_connected)
         self.assertTrue(self.client_chat.is_connected)
-        self.assertEqual(self.server_chat.peer_nickname, "Cliente")
-        self.assertEqual(self.client_chat.peer_nickname, "Servidor")
+        self.assertEqual(len(self.server_chat.connected_clients), 1)
         
         # Detener servidor y tareas del cliente
         server.close()

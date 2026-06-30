@@ -54,7 +54,8 @@ class EncryptedChat:
         self.input_field = None
         self.websocket = None
         self.is_connected = False
-        self.peer_nickname = "Otro"
+        self.is_server = False
+        self.connected_clients = set()
         self.tunnel_process = None
         self.tunnel_url = None
 
@@ -83,7 +84,12 @@ class EncryptedChat:
         # Título superior
         status_color = "32" if self.is_connected else "31" # 32=verde, 31=rojo
         lines.append(f"\033[1;36m┌─── AfterGrid Chat Cifrado ─────────────────────────────────────────────────┐\033[0m")
-        lines.append(f"\033[1;36m│\033[0m Nick: \033[1;33m{self.nickname}\033[0m | Conectado con: \033[1;35m{self.peer_nickname}\033[0m | Estado: \033[1;{status_color}m{'● Conectado' if self.is_connected else '○ Desconectado'}\033[0m")
+        if self.is_server:
+            total_connected = len(self.connected_clients)
+            lines.append(f"\033[1;36m│\033[0m Nick: \033[1;33m{self.nickname}\033[0m | Rol: \033[1;35mCreador Sala\033[0m | Conectados: \033[1;{status_color}m{total_connected} participantes\033[0m")
+        else:
+            status_text = "● Conectado a la Sala" if self.is_connected else "○ Desconectado"
+            lines.append(f"\033[1;36m│\033[0m Nick: \033[1;33m{self.nickname}\033[0m | Rol: \033[1;35mParticipante\033[0m | Estado: \033[1;{status_color}m{status_text}\033[0m")
         if self.tunnel_url:
             lines.append(f"\033[1;36m│\033[0m Túnel de Internet activo: \033[1;32m{self.tunnel_url}\033[0m")
         lines.append(f"\033[1;36m└────────────────────────────────────────────────────────────────────────────┘\033[0m")
@@ -111,11 +117,12 @@ class EncryptedChat:
         self.update_ui()
 
     def add_outgoing_message(self, text: str, msg_id: str, time_str: str):
-        """Agrega un mensaje enviado por mí, con marcas de estado dinámicas."""
+        """Agrega un mensaje enviado por mí, con marcas de estado dinámicas para grupos."""
         self.my_messages[msg_id] = {
             "text": text,
             "time": time_str,
-            "status": "sent" # sent -> delivered -> read
+            "delivered_by": set(),
+            "read_by": set()
         }
         self.render_my_messages_in_history(msg_id)
         self.update_ui()
@@ -123,11 +130,16 @@ class EncryptedChat:
     def render_my_messages_in_history(self, msg_id):
         """Genera el formateo visual para uno de mis mensajes y lo añade al historial."""
         msg = self.my_messages[msg_id]
+        delivered_users = msg.get("delivered_by", set())
+        read_users = msg.get("read_by", set())
+        
         status_indicator = "\033[30m✓\033[0m" # Un check gris (enviado)
-        if msg["status"] == "delivered":
-            status_indicator = "\033[1;30m✓✓\033[0m" # Doble check gris oscuro (entregado)
-        elif msg["status"] == "read":
-            status_indicator = "\033[1;34m✓✓\033[0m" # Doble check azul (leído)
+        if read_users:
+            names = ", ".join(sorted(read_users))
+            status_indicator = f"\033[1;34m✓✓ ({names})\033[0m" # Doble check azul con lectores
+        elif delivered_users:
+            names = ", ".join(sorted(delivered_users))
+            status_indicator = f"\033[1;30m✓✓ ({names})\033[0m" # Doble check gris con receptores
 
         # Buscamos si ya existe el mensaje en la pantalla para actualizarlo, si no, lo agregamos
         search_key = f"ID:{msg_id}"
@@ -142,23 +154,51 @@ class EncryptedChat:
         # Si no existe, lo agregamos
         self.message_history.append(formatted_line)
 
-    def handle_ack(self, msg_id: str, ack_type: str):
-        """Actualiza el estado de confirmación de un mensaje enviado."""
+    def handle_ack(self, msg_id: str, ack_type: str, sender: str):
+        """Actualiza el estado de confirmación de un mensaje enviado en grupo."""
         if msg_id in self.my_messages:
-            current_status = self.my_messages[msg_id]["status"]
-            # Evitamos sobreescribir 'read' con 'delivered'
+            msg = self.my_messages[msg_id]
             if ack_type == "read":
-                self.my_messages[msg_id]["status"] = "read"
-            elif ack_type == "delivered" and current_status == "sent":
-                self.my_messages[msg_id]["status"] = "delivered"
+                msg.setdefault("read_by", set()).add(sender)
+                msg.setdefault("delivered_by", set()).add(sender)
+            elif ack_type == "delivered":
+                msg.setdefault("delivered_by", set()).add(sender)
             
             self.render_my_messages_in_history(msg_id)
             self.update_ui()
 
+    async def broadcast_payload(self, encrypted_payload):
+        """Envía un payload cifrado a todos los destinos correspondientes."""
+        if self.is_server:
+            if self.connected_clients:
+                tasks = []
+                for client in list(self.connected_clients):
+                    tasks.append(asyncio.create_task(client.send(encrypted_payload)))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            if self.websocket:
+                await self.websocket.send(encrypted_payload)
+
+    async def broadcast_payload_to_others(self, encrypted_payload, exclude):
+        """Retransmite un mensaje cifrado a todos los clientes excepto al remitente original."""
+        if self.is_server and self.connected_clients:
+            tasks = []
+            for client in list(self.connected_clients):
+                if client != exclude:
+                    tasks.append(asyncio.create_task(client.send(encrypted_payload)))
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
     async def send_message(self, text: str):
-        """Envía un mensaje de texto cifrado a través del socket."""
-        if not self.is_connected or not self.websocket:
-            self.add_system_message("Error: No hay conexión con el otro terminal. Tu compañero debe conectarse a tu URL primero.", is_error=True)
+        """Envía un mensaje de texto cifrado al grupo."""
+        if self.is_server:
+            has_connection = len(self.connected_clients) > 0
+        else:
+            has_connection = self.is_connected and self.websocket is not None
+
+        if not has_connection:
+            self.add_system_message("Error: No hay conexión con ningún participante en la sala.", is_error=True)
             return
 
         msg_id = str(uuid.uuid4())[:8]
@@ -178,16 +218,12 @@ class EncryptedChat:
         encrypted_payload = self.encrypt(payload)
         
         try:
-            await self.websocket.send(encrypted_payload)
+            await self.broadcast_payload(encrypted_payload)
         except Exception as e:
             self.add_system_message(f"Error al enviar mensaje: {e}", is_error=True)
-            self.is_connected = False
-            self.update_ui()
 
     async def send_ack(self, msg_id: str, ack_type: str):
         """Envía una confirmación de entrega (delivered) o lectura (read) cifrada."""
-        if not self.websocket:
-            return
         payload = {
             "type": ack_type,
             "msg_id": msg_id,
@@ -195,7 +231,7 @@ class EncryptedChat:
         }
         encrypted_payload = self.encrypt(payload)
         try:
-            await self.websocket.send(encrypted_payload)
+            await self.broadcast_payload(encrypted_payload)
         except Exception:
             pass
 
@@ -205,11 +241,6 @@ class EncryptedChat:
             payload = self.decrypt(encrypted_data)
             p_type = payload.get("type")
             sender = payload.get("sender", "Otro")
-            self.peer_nickname = sender
-
-            if not self.is_connected:
-                self.is_connected = True
-                self.update_ui()
 
             if p_type == "msg":
                 msg_id = payload.get("id")
@@ -227,16 +258,14 @@ class EncryptedChat:
 
             elif p_type == "delivered":
                 msg_id = payload.get("msg_id")
-                self.handle_ack(msg_id, "delivered")
+                self.handle_ack(msg_id, "delivered", sender)
 
             elif p_type == "read":
                 msg_id = payload.get("msg_id")
-                self.handle_ack(msg_id, "read")
+                self.handle_ack(msg_id, "read", sender)
 
             elif p_type == "ping":
-                # Responder pong para mantener viva la conexión
-                pong = self.encrypt({"type": "pong", "sender": self.nickname})
-                await self.websocket.send(pong)
+                pass
                 
             elif p_type == "pong":
                 pass
@@ -246,26 +275,53 @@ class EncryptedChat:
             pass
 
     async def connection_handler(self, ws):
-        """Maneja la conexión WebSocket activa (servidor o cliente)."""
-        self.websocket = ws
-        self.is_connected = True
-        self.add_system_message("¡Conexión establecida con el otro terminal! Cifrado activo.")
-        
-        # Intercambiar pings iniciales para sincronizar nicks
-        try:
-            init_ping = self.encrypt({"type": "ping", "sender": self.nickname})
-            await ws.send(init_ping)
+        """Maneja una nueva conexión entrante (para servidor) o la conexión única (para cliente)."""
+        if self.is_server:
+            # Servidor: Agregar el cliente al grupo
+            self.connected_clients.add(ws)
+            self.is_connected = True
+            self.add_system_message(f"Un nuevo participante se ha unido a la sala. Conectados: {len(self.connected_clients)}")
             
-            async for message in ws:
-                await self.handle_incoming_payload(message)
-        except websockets.exceptions.ConnectionClosed:
-            self.add_system_message("La conexión se ha cerrado.")
-        except Exception as e:
-            self.add_system_message(f"Error en la conexión: {e}", is_error=True)
-        finally:
-            self.is_connected = False
-            self.websocket = None
-            self.update_ui()
+            try:
+                # Sincronización inicial
+                init_ping = self.encrypt({"type": "ping", "sender": self.nickname})
+                await ws.send(init_ping)
+                
+                async for message in ws:
+                    # Retransmitir a los otros clientes (ciego E2EE)
+                    await self.broadcast_payload_to_others(message, exclude=ws)
+                    # Procesar localmente
+                    await self.handle_incoming_payload(message)
+            except websockets.exceptions.ConnectionClosed:
+                pass
+            except Exception as e:
+                self.add_system_message(f"Error en la conexión con participante: {e}", is_error=True)
+            finally:
+                self.connected_clients.remove(ws)
+                if not self.connected_clients:
+                    self.is_connected = False
+                self.add_system_message(f"Un participante se ha desconectado. Conectados: {len(self.connected_clients)}")
+                self.update_ui()
+        else:
+            # Cliente: Conexión única directa al servidor
+            self.websocket = ws
+            self.is_connected = True
+            self.add_system_message("¡Conexión establecida con la sala! Cifrado activo.")
+            
+            try:
+                init_ping = self.encrypt({"type": "ping", "sender": self.nickname})
+                await ws.send(init_ping)
+                
+                async for message in ws:
+                    await self.handle_incoming_payload(message)
+            except websockets.exceptions.ConnectionClosed:
+                self.add_system_message("La conexión con la sala se ha cerrado.")
+            except Exception as e:
+                self.add_system_message(f"Error en la conexión con la sala: {e}", is_error=True)
+            finally:
+                self.is_connected = False
+                self.websocket = None
+                self.update_ui()
 
     async def start_server(self, host: str, port: int):
         """Inicia el servidor WebSocket local."""
@@ -382,9 +438,14 @@ def build_tui(chat_client: EncryptedChat):
     def handle_enter(event):
         text = chat_client.input_field.text.strip()
         if text:
-            # Si no hay conexión, mostrar error y NO borrar el mensaje escrito
-            if not chat_client.is_connected or not chat_client.websocket:
-                chat_client.add_system_message("Error: No hay conexión con el otro terminal. Tu compañero debe conectarse a tu URL primero.", is_error=True)
+            # Comprobar si hay conexión
+            if chat_client.is_server:
+                has_conn = len(chat_client.connected_clients) > 0
+            else:
+                has_conn = chat_client.is_connected and chat_client.websocket is not None
+                
+            if not has_conn:
+                chat_client.add_system_message("Error: No hay nadie más en la sala para recibir tu mensaje. Espera a que alguien se conecte.", is_error=True)
                 return
                 
             # Si hay conexión, limpiar campo de texto y enviar
@@ -494,6 +555,7 @@ async def main():
     # Inicializar cliente
     key = derive_key(password)
     chat_client = EncryptedChat(key, nickname)
+    chat_client.is_server = serve_mode
 
     # Construir la interfaz de terminal (TUI)
     app = build_tui(chat_client)
